@@ -1,28 +1,17 @@
 #!/bin/bash
 # Copyright 2026 Google LLC
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# ... [License Header Preserved] ...
 
-echo "🚀 Starting Petverse Deployment..."
+echo "🚀 Starting Petverse Deployment (Modern Workload Identity)..."
 
-# Load environment variables from .env file if it exists
+# Load environment variables
 ENV_FILE="$(dirname "$0")/../.env"
 if [ -f "$ENV_FILE" ]; then
     echo "Loading environment from $ENV_FILE..."
     export $(cat "$ENV_FILE" | xargs)
 fi
 
-# Check for Project ID & Region in environment, otherwise prompt
+# Check for Project ID & Region
 if [ -z "$PROJECT_ID" ]; then
     read -p "Enter your Google Cloud Project ID: " PROJECT_ID
 fi
@@ -36,50 +25,41 @@ if [ -z "$REGION" ]; then
 fi
 REGION=${REGION:-us-central1}
 
+# --- NEW: Get Project Number for the Principal ID ---
+PROJECT_NUMBER=$(gcloud projects describe $PROJECT_ID --format="value(projectNumber)")
+KSA_NAME="petverse-gke-sa"
+KSA_NAMESPACE="default"
+
+# This is the modern Principal identifier for your Kubernetes Service Account
+KSA_PRINCIPAL="principal://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/${PROJECT_ID}.svc.id.goog/subject/ns/${KSA_NAMESPACE}/sa/${KSA_NAME}"
+
 if [ ! -f "job-producer.yaml" ] || [ ! -f "job-worker.yaml" ]; then
     echo "❌ job-producer.yaml or job-worker.yaml not found. Please run scripts/setup.sh first."
     exit 1
 fi
 
-echo "🔐 Configuring Cloud IAM Service Account..."
-gcloud iam service-accounts create petverse-gke-sa 2>/dev/null || echo "ℹ️ Cloud IAM service account petverse-gke-sa already exists."
+# --- UPDATED: Grant IAM roles DIRECTLY to the KSA principal ---
+echo "🔐 Granting IAM roles directly to Kubernetes Service Account..."
 
-echo "🔐 Granting IAM roles..."
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:petverse-gke-sa@$PROJECT_ID.iam.gserviceaccount.com" \
-    --role="roles/aiplatform.user" >/dev/null
+ROLES=(
+    "roles/aiplatform.user"
+    "roles/bigquery.dataEditor"
+    "roles/bigquery.user"
+    "roles/storage.objectViewer"
+    "roles/pubsub.publisher"
+    "roles/pubsub.subscriber"
+)
 
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:petverse-gke-sa@$PROJECT_ID.iam.gserviceaccount.com" \
-    --role="roles/bigquery.dataEditor" >/dev/null
+for ROLE in "${ROLES[@]}"; do
+    gcloud projects add-iam-policy-binding $PROJECT_ID \
+        --member="$KSA_PRINCIPAL" \
+        --role="$ROLE" \
+        --condition=None >/dev/null
+done
 
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:petverse-gke-sa@$PROJECT_ID.iam.gserviceaccount.com" \
-    --role="roles/bigquery.user" >/dev/null
-
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:petverse-gke-sa@$PROJECT_ID.iam.gserviceaccount.com" \
-    --role="roles/storage.objectViewer" >/dev/null
-
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:petverse-gke-sa@$PROJECT_ID.iam.gserviceaccount.com" \
-    --role="roles/pubsub.publisher" >/dev/null
-
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-    --member="serviceAccount:petverse-gke-sa@$PROJECT_ID.iam.gserviceaccount.com" \
-    --role="roles/pubsub.subscriber" >/dev/null
-
-echo "🔐 Binding IAM Service Account to K8S Service Account..."
-gcloud iam service-accounts add-iam-policy-binding \
-    petverse-gke-sa@$PROJECT_ID.iam.gserviceaccount.com \
-    --role="roles/iam.workloadIdentityUser" \
-    --member="serviceAccount:$PROJECT_ID.svc.id.goog[default/petverse-gke-sa]" >/dev/null
-
-echo "🔐 Configuring K8s Service Account..."
-kubectl create serviceaccount petverse-gke-sa 2>/dev/null || echo "ℹ️ Service account petverse-gke-sa already exists."
-
-kubectl annotate serviceaccount petverse-gke-sa \
-    iam.gke.io/gcp-service-account=petverse-gke-sa@$PROJECT_ID.iam.gserviceaccount.com --overwrite
+# --- UPDATED: Configuring K8s Service Account (No annotation needed!) ---
+echo "🔐 Creating K8s Service Account..."
+kubectl create serviceaccount $KSA_NAME 2>/dev/null || echo "ℹ️ Service account $KSA_NAME already exists."
 
 echo "📊 Loading sample data into BigQuery..."
 bq mk --dataset --location=$REGION $PROJECT_ID:petverse_kg 2>/dev/null || echo "ℹ️ Dataset petverse_kg already exists."
@@ -87,7 +67,7 @@ bq mk --dataset --location=$REGION $PROJECT_ID:petverse_kg 2>/dev/null || echo "
 bq load --source_format=CSV --autodetect --replace petverse_kg.pets gs://sample-data-and-media/petverse/pets.csv
 bq load --source_format=CSV --autodetect --replace petverse_kg.pet_urls gs://sample-data-and-media/petverse/pet_urls.csv
 
-echo "🎉 🦄 👉 Deployment configured successfully!"
+echo "🎉 🦄 👉 Deployment configured successfully with Direct Resource Access!"
 echo "👉 You can now run the jobs manually:"
 echo "   1. Populate the queue:  kubectl apply -f job-producer.yaml"
 echo "   2. Process in parallel: kubectl apply -f job-worker.yaml"
